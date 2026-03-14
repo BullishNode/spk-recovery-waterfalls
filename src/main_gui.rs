@@ -1,18 +1,19 @@
 use std::sync::Arc;
 use tokio::sync::mpsc as tokio_mpsc;
 
-use crate::styles;
-use crate::util::{broadcast::broadcast_psbt, sign::sign_psbt, sync::sync_wallet, SyncResult};
-use iced::window;
+use crate::{
+    styles,
+    util::{broadcast::broadcast_psbt, sign::sign_psbt, sync::sync_wallet, SyncResult},
+};
 use iced::{
     alignment,
     font::Font,
     widget::{
         button, checkbox, column, container, row, scrollable, text, text_input, Column, Space,
     },
-    Element, Length, Padding, Size, Subscription, Task, Theme,
+    window, Element, Length, Padding, Size, Subscription, Task, Theme,
 };
-use miniscript::bitcoin::Txid;
+use miniscript::bitcoin::{self, Txid};
 
 const GOLOS_TEXT: Font = Font::with_name("Golos Text");
 
@@ -45,6 +46,7 @@ enum Message {
 }
 
 struct WalletApp {
+    network: bitcoin::Network,
     descriptor: String,
     ip: String,
     port: String,
@@ -71,6 +73,7 @@ struct WalletApp {
 impl Default for WalletApp {
     fn default() -> Self {
         Self {
+            network: bitcoin::Network::Bitcoin,
             descriptor: String::new(),
             ip: String::from("ssl://fulcrum.bullbitcoin.com"),
             port: String::from("50002"),
@@ -97,12 +100,20 @@ impl Default for WalletApp {
 }
 
 impl WalletApp {
-    pub fn new() -> (Self, Task<Message>) {
-        (Self::default(), Task::none())
+    pub fn new(network: bitcoin::Network) -> (Self, Task<Message>) {
+        let app = Self {
+            network,
+            ..Default::default()
+        };
+        (app, Task::none())
     }
 
     pub fn title(&self) -> String {
-        "SPK Recovery Tool".to_string()
+        let network = match self.network {
+            bitcoin::Network::Bitcoin => String::new(),
+            n => format!("({n})"),
+        };
+        format!("SPK Recovery Tool {network}")
     }
 
     pub fn theme(&self) -> Theme {
@@ -188,12 +199,14 @@ impl WalletApp {
                 let max = self.max.clone();
                 let batch = self.batch.clone();
                 let fee = self.fee.clone();
+                let network = self.network;
 
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
                             sync_wallet(
                                 descriptor, ip, port, target, address, max, batch, fee, log_tx,
+                                network,
                             )
                         })
                         .await
@@ -228,11 +241,12 @@ impl WalletApp {
 
                 let mnemonic = self.mnemonic.clone();
                 let descriptor = self.descriptor.clone();
+                let network = self.network;
 
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            sign_psbt(mnemonic, psbt_str, descriptor)
+                            sign_psbt(mnemonic, psbt_str, descriptor, network)
                         })
                         .await
                         .map_err(|e| format!("Task error: {}", e))?
@@ -968,7 +982,7 @@ fn log_stream(
     })
 }
 
-pub fn run() -> Result<(), iced::Error> {
+pub fn run(network: bitcoin::Network) -> Result<(), iced::Error> {
     iced::application(WalletApp::title, WalletApp::update, WalletApp::view)
         .theme(WalletApp::theme)
         .subscription(WalletApp::subscription)
@@ -978,5 +992,5 @@ pub fn run() -> Result<(), iced::Error> {
             ..Default::default()
         })
         .font(include_bytes!("../assets/GolosText-Regular.ttf"))
-        .run_with(WalletApp::new)
+        .run_with(move || WalletApp::new(network))
 }

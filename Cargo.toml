@@ -5,7 +5,9 @@ edition = "2021"
 
 [dependencies]
 bip39 = "2.0.0"
-bwk-electrum = "0.0.4"
+bwk-electrum = { git = "https://github.com/pythcoiner/bwk.git", rev = "e85de4f"}
+bwk-tx = { git = "https://github.com/pythcoiner/bwk.git", rev = "e85de4f"}
+bwk-sign = { git = "https://github.com/pythcoiner/bwk.git", rev = "e85de4f"}
 clap = { version = "4.5.51", features = ["derive"] }
 futures = "0.3"
 iced = { version = "0.13", features = ["tokio"] }
@@ -13,3 +15,6 @@ miniscript = "12.3.5"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tokio = { version = "1", features = ["full"] }
+
+[patch.crates-io]
+bitcoin = { git = "https://github.com/pythcoiner/rust-bitcoin.git", rev = "d7998651" }

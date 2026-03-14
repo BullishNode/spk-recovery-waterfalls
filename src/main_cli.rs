@@ -1,7 +1,8 @@
-use std::{fs, path::PathBuf, time::SystemTime};
-use clap::Parser;
-use tokio::sync::mpsc as tokio_mpsc;
 use crate::util::sync::sync_wallet;
+use clap::Parser;
+use miniscript::bitcoin;
+use std::{fs, path::PathBuf, time::SystemTime};
+use tokio::sync::mpsc as tokio_mpsc;
 
 #[derive(Parser, Debug)]
 #[command(name = "spk_recovery")]
@@ -40,7 +41,7 @@ struct Args {
     fee: u64,
 }
 
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(network: bitcoin::Network) -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let start = SystemTime::now();
 
@@ -65,6 +66,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         args.batch.to_string(),
         args.fee.to_string(),
         log_tx,
+        network,
     )?;
 
     println!("\n{} inputs: {}", result.num_inputs, result.total_value);

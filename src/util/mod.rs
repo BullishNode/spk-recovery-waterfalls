@@ -1,10 +1,10 @@
-pub mod sync;
-pub mod sign;
 pub mod broadcast;
+pub mod sign;
+pub mod sync;
 
 use miniscript::bitcoin::Amount;
+use miniscript::bitcoin::ScriptBuf;
 use serde::{Deserialize, Serialize};
-use miniscript::bitcoin::{OutPoint, ScriptBuf, TxOut};
 
 #[derive(Debug, Clone)]
 pub struct SyncResult {
@@ -19,15 +19,5 @@ pub struct SyncResult {
 pub struct SpkEntry {
     pub spk: ScriptBuf,
     pub change: bool,
-    pub index: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Coin {
-    pub outpoint: OutPoint,
-    pub txout: TxOut,
-    pub value: Amount,
-    pub spent: bool,
-    pub is_change: bool,
     pub index: u32,
 }

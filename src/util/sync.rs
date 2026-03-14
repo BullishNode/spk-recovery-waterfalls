@@ -1,18 +1,17 @@
 use std::{collections::BTreeMap, str::FromStr, sync::mpsc, time::SystemTime};
 
+use bwk_tx::{
+    transaction::max_input_satisfaction_size, ChangeRecipientProvider, Coin, CoinStatus, KeyChain,
+};
 use tokio::sync::mpsc::UnboundedSender as LogSender;
 
 use bwk_electrum::client::{CoinRequest, CoinResponse};
 use miniscript::{
-    bitcoin::{
-        absolute, psbt::Input, transaction::Version, Address, Amount, Network, OutPoint, Psbt,
-        ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
-    },
-    psbt::PsbtExt,
+    bitcoin::{self, Address, Network, OutPoint, ScriptBuf, Transaction, Txid},
     Descriptor, DescriptorPublicKey,
 };
 
-use super::{Coin, SpkEntry, SyncResult};
+use super::{SpkEntry, SyncResult};
 
 type TxMap = BTreeMap<Txid, Transaction>;
 type CoinMap = BTreeMap<OutPoint, Coin>;
@@ -28,30 +27,40 @@ pub fn sync_wallet(
     batch: String,
     fee: String,
     log_tx: LogSender<String>,
+    network: Network,
 ) -> Result<SyncResult, String> {
-    let target: u32 = target
+    let target_index: u32 = target
         .parse()
         .map_err(|e| format!("Invalid target: {}", e))?;
     let mut max: u32 = max.parse().map_err(|e| format!("Invalid max: {}", e))?;
     let batch: u32 = batch.parse().map_err(|e| format!("Invalid batch: {}", e))?;
-    let fee: u64 = fee.parse().map_err(|e| format!("Invalid fee: {}", e))?;
+    let feerate: f32 = fee.parse().map_err(|e| format!("Invalid fee: {}", e))?;
+    let feerate = (feerate * 1000.0) as u64;
     let port: u16 = port.parse().map_err(|e| format!("Invalid port: {}", e))?;
 
     max /= 2;
 
     let address = Address::from_str(&address).map_err(|e| format!("Invalid address: {}", e))?;
-    if !address.is_valid_for_network(Network::Bitcoin) {
+    if !address.is_valid_for_network(network) {
         return Err("Address is for another network".to_string());
     }
-    let addr = address.assume_checked();
 
     let descriptor = Descriptor::<DescriptorPublicKey>::from_str(descriptor_str.trim())
         .map_err(|e| format!("Invalid descriptor: {}", e))?;
+    let satisfaction_size = max_input_satisfaction_size(&descriptor) as u64;
     let descriptors = descriptor
+        .clone()
         .into_single_descriptors()
         .map_err(|e| format!("Descriptor error: {}", e))?;
     let recv_descriptor = descriptors.first().ok_or("No receive descriptor")?.clone();
     let change_descriptor = descriptors.get(1).ok_or("No change descriptor")?.clone();
+
+    let test_addr = recv_descriptor
+        .at_derivation_index(25000)
+        .unwrap()
+        .address(network)
+        .unwrap();
+    println!("test addr: {test_addr}");
 
     let mut client = bwk_electrum::client::Client::new_local(&ip, port)
         .map_err(|e| format!("Failed to connect: {:?}", e))?;
@@ -62,10 +71,10 @@ pub fn sync_wallet(
     let mut i = 0u32;
     let start = SystemTime::now();
 
-    let _ = log_tx.send(format!("Starting sync up to index {}", target));
+    let _ = log_tx.send(format!("Starting sync up to index {}", target_index));
     let _ = log_tx.send(format!("Connected to {}:{}", ip, port));
 
-    while i < target {
+    while i < target_index {
         let elapsed = SystemTime::now().duration_since(start).unwrap();
 
         if i > 0 && i % max == 0 {
@@ -83,13 +92,13 @@ pub fn sync_wallet(
 
         if i % 1000 == 0 {
             let elapsed = SystemTime::now().duration_since(start).unwrap();
-            let pct = i * 100 / target;
+            let pct = i * 100 / target_index;
             let _ = log_tx.send(format!("{:?} -- scan height {} ({}%) --", elapsed, i, pct));
         }
 
         if i % 100 == 0 && i % 1000 != 0 {
             let elapsed = SystemTime::now().duration_since(start).unwrap();
-            let pct = i * 100 / target;
+            let pct = i * 100 / target_index;
             let _ = log_tx.send(format!(
                 "{:?} -- Processing index {} ({}%) --",
                 elapsed, i, pct
@@ -160,31 +169,43 @@ pub fn sync_wallet(
                     txid: *txid,
                     vout: vout as u32,
                 };
+                let kc = if is_change {
+                    KeyChain::Change
+                } else {
+                    KeyChain::Receive
+                };
+                let coin_path = (kc, index);
                 let coin = Coin {
-                    outpoint,
-                    value: txout.value,
-                    spent: false,
-                    is_change,
-                    index,
                     txout: txout.clone(),
+                    outpoint,
+                    height: None,
+                    sequence: Default::default(),
+                    status: CoinStatus::Confirmed,
+                    label: None,
+                    satisfaction_size,
+                    spend_info: bwk_tx::CoinSpendInfo::Bip32 {
+                        coin_path,
+                        descriptor: descriptor.clone(),
+                    },
                 };
                 coins_map.insert(outpoint, coin);
             }
         }
     }
 
+    // Mark spent coins
     for tx in tx_map.values() {
         for txin in tx.input.iter() {
             let op = txin.previous_output;
             if let Some(coin) = coins_map.get_mut(&op) {
-                coin.spent = true;
+                coin.status = CoinStatus::Spent;
             }
         }
     }
 
     let unspent_coins: Vec<_> = coins_map
         .into_iter()
-        .filter_map(|(_, c)| (!c.spent).then_some(c))
+        .filter_map(|(_, c)| (c.status != CoinStatus::Spent).then_some(c))
         .collect();
 
     let _ = log_tx.send(format!("Found {} unspent coins", unspent_coins.len()));
@@ -193,68 +214,35 @@ pub fn sync_wallet(
         return Err("No unspent coins found".to_string());
     }
 
-    let txout = TxOut {
-        value: Amount::from_btc(21_000_000.0).unwrap(),
-        script_pubkey: addr.script_pubkey(),
-    };
-    let tx = Transaction {
-        version: Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![],
-        output: vec![txout],
-    };
-
-    let mut psbt = Psbt::from_unsigned_tx(tx).map_err(|e| format!("PSBT error: {}", e))?;
-
-    let mut sum_inputs = Amount::ZERO;
-    for (pos, coin) in unspent_coins.into_iter().enumerate() {
-        sum_inputs += coin.value;
-        let txin = TxIn {
-            previous_output: coin.outpoint,
-            script_sig: ScriptBuf::default(),
-            sequence: Sequence::ZERO,
-            witness: Witness::default(),
-        };
-
-        psbt.unsigned_tx.input.push(txin);
-
-        let psbt_input = Input {
-            witness_utxo: Some(coin.txout.clone()),
-            ..Default::default()
-        };
-        psbt.inputs.push(psbt_input);
-
-        let descriptor = if coin.is_change {
-            change_descriptor.at_derivation_index(coin.index).unwrap()
-        } else {
-            recv_descriptor.at_derivation_index(coin.index).unwrap()
-        };
-        PsbtExt::update_input_with_descriptor(&mut psbt, pos, &descriptor)
-            .map_err(|e| format!("Failed to update PSBT: {}", e))?;
-    }
-
-    let signatures_unit_weight = recv_descriptor.max_weight_to_satisfy().unwrap();
-    let signatures_weight = signatures_unit_weight
-        .checked_mul(psbt.unsigned_tx.input.len() as u64)
+    let cp = ChangeRecipientProvider::new(descriptor, network);
+    let psbt = bwk_tx::TxBuilder::new(Box::new(cp))
+        .inputs(unspent_coins)
+        .sweep(address.clone().assume_checked(), feerate)
         .unwrap();
-    let unsigned_tx_weight = psbt.unsigned_tx.weight();
-    let weight_vb = (signatures_weight + unsigned_tx_weight).to_vbytes_ceil();
-    let fees = Amount::from_sat(fee * weight_vb);
 
-    let output_value = sum_inputs - fees;
-    psbt.unsigned_tx.output[0].value = output_value;
+    let sum_inputs = psbt.inputs.iter().fold(bitcoin::Amount::ZERO, |a, b| {
+        a + b.witness_utxo.as_ref().unwrap().value
+    });
+
+    let sum_outputs = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .fold(bitcoin::Amount::ZERO, |a, b| a + b.value);
+
+    let fees = sum_inputs - sum_outputs;
 
     let _ = log_tx.send(format!("Created PSBT with {} inputs", psbt.inputs.len()));
     let _ = log_tx.send(format!("Total input: {} BTC", sum_inputs.to_btc()));
     let _ = log_tx.send(format!("Fees: {} sats", fees.to_sat()));
-    let _ = log_tx.send(format!("Output: {} BTC", output_value.to_btc()));
+    let _ = log_tx.send(format!("Output: {} BTC", sum_outputs.to_btc()));
 
     Ok(SyncResult {
         psbt: psbt.to_string(),
         num_inputs: psbt.inputs.len(),
         total_value: sum_inputs,
         fees,
-        output_value,
+        output_value: sum_outputs,
     })
 }
 
