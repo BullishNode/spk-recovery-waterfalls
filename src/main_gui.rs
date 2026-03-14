@@ -1,4 +1,7 @@
-use std::sync::{mpsc, Arc, Mutex};
+use std::{
+    str::FromStr,
+    sync::{mpsc, Arc, Mutex},
+};
 
 use crate::{
     styles,
@@ -12,7 +15,10 @@ use iced::{
     },
     window, Element, Length, Padding, Size, Subscription, Task, Theme,
 };
-use miniscript::bitcoin::{self, Txid};
+use miniscript::{
+    bitcoin::{self, Txid},
+    Descriptor, DescriptorPublicKey,
+};
 
 const GOLOS_TEXT: Font = Font::with_name("Golos Text");
 
@@ -47,10 +53,12 @@ enum Message {
 struct WalletApp {
     network: bitcoin::Network,
     descriptor: String,
+    descriptor_valid: bool,
     ip: String,
     port: String,
     target: String,
     address: String,
+    address_valid: bool,
     max: String,
     batch: String,
     fee: String,
@@ -74,10 +82,12 @@ impl Default for WalletApp {
         Self {
             network: bitcoin::Network::Bitcoin,
             descriptor: String::new(),
+            descriptor_valid: false,
             ip: String::from("ssl://fulcrum.bullbitcoin.com"),
             port: String::from("50002"),
             target: String::from("10000"),
             address: String::new(),
+            address_valid: false,
             max: String::from("20000"),
             batch: String::from("10000"),
             fee: String::from("1"),
@@ -122,6 +132,7 @@ impl WalletApp {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::DescriptorChanged(value) => {
+                self.descriptor_valid = Descriptor::<DescriptorPublicKey>::from_str(&value).is_ok();
                 self.descriptor = value;
                 Task::none()
             }
@@ -142,6 +153,12 @@ impl WalletApp {
                 Task::none()
             }
             Message::AddressChanged(value) => {
+                self.address_valid = false;
+                if let Ok(addr) = bitcoin::Address::from_str(&value) {
+                    if addr.is_valid_for_network(self.network) {
+                        self.address_valid = true;
+                    }
+                }
                 self.address = value;
                 Task::none()
             }
@@ -591,11 +608,13 @@ impl WalletApp {
         .padding([12, 24])
         .width(Length::Fixed(220.0))
         .style(|_theme, status| styles::primary_button(status))
-        .on_press_maybe(if !self.is_processing {
-            Some(Message::SyncClicked)
-        } else {
-            None
-        });
+        .on_press_maybe(
+            if !self.is_processing && self.descriptor_valid && self.address_valid {
+                Some(Message::SyncClicked)
+            } else {
+                None
+            },
+        );
 
         let body = column![
             Space::with_height(4),
