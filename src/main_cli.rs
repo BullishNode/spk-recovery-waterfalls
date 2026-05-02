@@ -28,10 +28,15 @@ struct Args {
     /// Set high to catch funds past wide unused gaps. The server still applies its 20-address gap limit
     /// past this index for the tail stop.
     to_index: u32,
+
+    #[arg(short, long, default_value = "bitcoin")]
+    /// Bitcoin network: bitcoin, testnet, signet, regtest
+    network: bitcoin::Network,
 }
 
-pub fn run(network: bitcoin::Network) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(_default_network: bitcoin::Network) -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let network = args.network;
     let start = SystemTime::now();
 
     println!("Open descriptor file at {}", args.descriptor.display());
