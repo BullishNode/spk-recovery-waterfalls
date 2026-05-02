@@ -4,40 +4,29 @@ use bwk_tx::{
     transaction::max_input_satisfaction_size, ChangeRecipientProvider, Coin, CoinStatus, KeyChain,
 };
 
-use bwk_electrum::client::{CoinRequest, CoinResponse};
 use miniscript::{
-    bitcoin::{self, Address, Network, OutPoint, ScriptBuf, Transaction, Txid},
+    bitcoin::{self, Address, Network, OutPoint, Transaction, Txid},
     Descriptor, DescriptorPublicKey,
 };
+
+use waterfalls_client::{api::V, Builder};
 
 use super::SyncResult;
 
 type TxMap = BTreeMap<Txid, Transaction>;
 type CoinMap = BTreeMap<OutPoint, Coin>;
 
-#[allow(clippy::too_many_arguments)]
 pub fn sync_wallet(
     descriptor_str: String,
-    ip: String,
-    port: String,
-    target: String,
+    url: String,
     address: String,
-    max: String,
-    batch: String,
     fee: String,
+    to_index: u32,
     log_tx: mpsc::Sender<String>,
     network: Network,
 ) -> Result<SyncResult, String> {
-    let target_index: u32 = target
-        .parse()
-        .map_err(|e| format!("Invalid target: {}", e))?;
-    let mut max: u32 = max.parse().map_err(|e| format!("Invalid max: {}", e))?;
-    let batch: u32 = batch.parse().map_err(|e| format!("Invalid batch: {}", e))?;
     let feerate: f32 = fee.parse().map_err(|e| format!("Invalid fee: {}", e))?;
     let feerate = (feerate * 1000.0) as u64;
-    let port: u16 = port.parse().map_err(|e| format!("Invalid port: {}", e))?;
-
-    max /= 2;
 
     let address = Address::from_str(&address).map_err(|e| format!("Invalid address: {}", e))?;
     if !address.is_valid_for_network(network) {
@@ -47,156 +36,115 @@ pub fn sync_wallet(
     let descriptor = Descriptor::<DescriptorPublicKey>::from_str(descriptor_str.trim())
         .map_err(|e| format!("Invalid descriptor: {}", e))?;
     let satisfaction_size = max_input_satisfaction_size(&descriptor) as u64;
-    let descriptors = descriptor
-        .clone()
-        .into_single_descriptors()
-        .map_err(|e| format!("Descriptor error: {}", e))?;
-    let recv_descriptor = descriptors.first().ok_or("No receive descriptor")?.clone();
-    let change_descriptor = descriptors.get(1).ok_or("No change descriptor")?.clone();
 
-    let test_addr = recv_descriptor
-        .at_derivation_index(25000)
-        .unwrap()
-        .address(network)
-        .unwrap();
-    println!("test addr: {test_addr}");
-
-    let mut client = bwk_electrum::client::Client::new_local(&ip, port)
-        .map_err(|e| format!("Failed to connect: {:?}", e))?;
-    let (mut sender, mut receiver) = client.listen();
-
-    let mut spks_index = BTreeMap::new();
-    let mut funded_spks = vec![];
-    let mut i = 0u32;
     let start = SystemTime::now();
+    let _ = log_tx.send(format!("Connecting to Waterfalls at {}", url));
 
-    let _ = log_tx.send(format!("Starting sync up to index {}", target_index));
-    let _ = log_tx.send(format!("Connected to {}:{}", ip, port));
-
-    while i < target_index {
-        let elapsed = SystemTime::now().duration_since(start).unwrap();
-
-        if i > 0 && i % max == 0 {
-            let _ = log_tx.send(format!(
-                "{:?} -- Closing old client and creating new client at index {} --",
-                elapsed, i
-            ));
-
-            client = bwk_electrum::client::Client::new_local(&ip, port)
-                .map_err(|e| format!("Failed to reconnect: {:?}", e))?;
-            (sender, receiver) = client.listen();
-
-            let _ = log_tx.send(format!("{:?} -- New client ready --", elapsed));
-        }
-
-        if i % 1000 == 0 {
-            let elapsed = SystemTime::now().duration_since(start).unwrap();
-            let pct = i * 100 / target_index;
-            let _ = log_tx.send(format!("{:?} -- scan height {} ({}%) --", elapsed, i, pct));
-        }
-
-        if i % 100 == 0 && i % 1000 != 0 {
-            let elapsed = SystemTime::now().duration_since(start).unwrap();
-            let pct = i * 100 / target_index;
-            let _ = log_tx.send(format!(
-                "{:?} -- Processing index {} ({}%) --",
-                elapsed, i, pct
-            ));
-        }
-
-        let recv_spks = spks_from(&recv_descriptor, i, batch);
-        let change_spks = spks_from(&change_descriptor, i, batch);
-
-        for (p, script) in recv_spks.iter().enumerate() {
-            let index = i + (p as u32);
-            spks_index.insert(script.clone(), (false, index));
-        }
-
-        for (p, script) in change_spks.iter().enumerate() {
-            let index = i + (p as u32);
-            spks_index.insert(script.clone(), (true, index));
-        }
-
-        scan(
-            start,
-            &mut sender,
-            &mut receiver,
-            recv_spks,
-            &spks_index,
-            false,
-            &mut funded_spks,
-            log_tx.clone(),
-        )?;
-
-        scan(
-            start,
-            &mut sender,
-            &mut receiver,
-            change_spks,
-            &spks_index,
-            true,
-            &mut funded_spks,
-            log_tx.clone(),
-        )?;
-
-        i += batch;
-    }
+    let client = Builder::new(&url).build_blocking();
 
     let _ = log_tx.send(format!(
-        "Scan complete. Found {} total outputs",
-        funded_spks.len()
+        "Querying descriptor history (one shot, to_index={})...",
+        to_index
     ));
-    let _ = log_tx.send("STATUS:Building Transaction".to_string());
-    let _ = log_tx.send("Fetching transactions and building PSBT...".to_string());
 
-    client = bwk_electrum::client::Client::new_local(&ip, port)
-        .map_err(|e| format!("Failed to reconnect: {:?}", e))?;
-    (sender, receiver) = client.listen();
+    let resp = client
+        .waterfalls_version(
+            descriptor_str.trim(),
+            4,
+            None,
+            Some(to_index),
+            false,
+        )
+        .map_err(|e| format!("Waterfalls query failed: {:?}", e))?;
 
-    let mut tx_map: TxMap = BTreeMap::new();
-    for spk in funded_spks {
-        get_txs_for_spk(&mut sender, &mut receiver, spk, &mut tx_map);
-    }
+    let elapsed = SystemTime::now().duration_since(start).unwrap();
+    let total_seen: usize = resp
+        .txs_seen
+        .values()
+        .flat_map(|v| v.iter())
+        .map(|s| s.len())
+        .sum();
+    let _ = log_tx.send(format!(
+        "{:?} -- Waterfalls returned {} TxSeen entries across {} descriptor branches --",
+        elapsed,
+        total_seen,
+        resp.txs_seen.len()
+    ));
 
-    let _ = log_tx.send(format!("Fetched {} unique transactions", tx_map.len()));
+    // Walk the response: outer key = descriptor branch index ("0" recv, "1" change),
+    // inner Vec is per-derivation-index, each containing TxSeen entries.
+    let mut funded: Vec<(Txid, u32, KeyChain, u32)> = vec![];
+    let mut needed_txids: BTreeMap<Txid, ()> = BTreeMap::new();
 
-    let mut coins_map: CoinMap = BTreeMap::new();
-    for (txid, tx) in &tx_map {
-        for (vout, txout) in tx.output.iter().enumerate() {
-            if let Some((is_change, index)) = spks_index.get(&txout.script_pubkey).cloned() {
-                let outpoint = OutPoint {
-                    txid: *txid,
-                    vout: vout as u32,
-                };
-                let kc = if is_change {
-                    KeyChain::Change
-                } else {
-                    KeyChain::Receive
-                };
-                let coin_path = (kc, index);
-                let coin = Coin {
-                    txout: txout.clone(),
-                    outpoint,
-                    height: None,
-                    sequence: Default::default(),
-                    status: CoinStatus::Confirmed,
-                    label: None,
-                    satisfaction_size,
-                    spend_info: bwk_tx::CoinSpendInfo::Bip32 {
-                        coin_path,
-                        descriptor: descriptor.clone(),
-                    },
-                };
-                coins_map.insert(outpoint, coin);
+    for (branch_key, scripts) in &resp.txs_seen {
+        let branch_idx: u32 = branch_key
+            .parse()
+            .map_err(|e| format!("Invalid branch index '{}': {}", branch_key, e))?;
+        let kc = match branch_idx {
+            0 => KeyChain::Receive,
+            1 => KeyChain::Change,
+            n => return Err(format!("Unexpected descriptor branch index {}", n)),
+        };
+
+        for (deriv_index, seen_list) in scripts.iter().enumerate() {
+            for ts in seen_list {
+                needed_txids.insert(ts.txid, ());
+                if let V::Vout(vout) = ts.v {
+                    funded.push((ts.txid, vout, kc, deriv_index as u32));
+                }
             }
         }
     }
 
-    // Mark spent coins
+    let _ = log_tx.send(format!(
+        "Need to fetch {} unique transactions",
+        needed_txids.len()
+    ));
+
+    let mut tx_map: TxMap = BTreeMap::new();
+    for (i, txid) in needed_txids.keys().enumerate() {
+        let tx = client
+            .get_tx(txid)
+            .map_err(|e| format!("Failed to fetch tx {}: {:?}", txid, e))?
+            .ok_or_else(|| format!("Tx {} not found on server", txid))?;
+        tx_map.insert(*txid, tx);
+        if (i + 1) % 50 == 0 {
+            let _ = log_tx.send(format!("  fetched {}/{} txs", i + 1, needed_txids.len()));
+        }
+    }
+
+    let _ = log_tx.send(format!("Fetched {} transactions", tx_map.len()));
+
+    let mut coins_map: CoinMap = BTreeMap::new();
+    for (txid, vout, kc, deriv_index) in funded {
+        let tx = tx_map
+            .get(&txid)
+            .ok_or_else(|| format!("Missing tx {} for funded output", txid))?;
+        let txout = tx
+            .output
+            .get(vout as usize)
+            .ok_or_else(|| format!("vout {} out of range for tx {}", vout, txid))?
+            .clone();
+        let outpoint = OutPoint { txid, vout };
+        let coin = Coin {
+            txout,
+            outpoint,
+            height: None,
+            sequence: Default::default(),
+            status: CoinStatus::Confirmed,
+            label: None,
+            satisfaction_size,
+            spend_info: bwk_tx::CoinSpendInfo::Bip32 {
+                coin_path: (kc, deriv_index),
+                descriptor: descriptor.clone(),
+            },
+        };
+        coins_map.insert(outpoint, coin);
+    }
+
     for tx in tx_map.values() {
         for txin in tx.input.iter() {
-            let op = txin.previous_output;
-            if let Some(coin) = coins_map.get_mut(&op) {
+            if let Some(coin) = coins_map.get_mut(&txin.previous_output) {
                 coin.status = CoinStatus::Spent;
             }
         }
@@ -243,113 +191,4 @@ pub fn sync_wallet(
         fees,
         output_value: sum_outputs,
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scan(
-    start: SystemTime,
-    sender: &mut mpsc::Sender<CoinRequest>,
-    receiver: &mut mpsc::Receiver<CoinResponse>,
-    spks: Vec<ScriptBuf>,
-    spks_index: &BTreeMap<ScriptBuf, (bool, u32)>,
-    is_change: bool,
-    funded_spks: &mut Vec<ScriptBuf>,
-    log_tx: mpsc::Sender<String>,
-) -> Result<(), String> {
-    let len = spks.len();
-    let change_str = if is_change { "change" } else { "recv" };
-
-    let req = CoinRequest::Subscribe(spks);
-    sender.send(req).map_err(|e| format!("Send error: {}", e))?;
-
-    let elapsed = SystemTime::now().duration_since(start).unwrap();
-    let _ = log_tx.send(format!(
-        "{:?} -- Waiting for {} response ({} spks) --",
-        elapsed, change_str, len
-    ));
-
-    let resp: CoinResponse = receiver.recv().map_err(|e| format!("Recv error: {}", e))?;
-
-    let elapsed = SystemTime::now().duration_since(start).unwrap();
-    let _ = log_tx.send(format!(
-        "{:?} -- Received {} response --",
-        elapsed, change_str
-    ));
-
-    match resp {
-        CoinResponse::Status(statuses) => {
-            assert!(statuses.len() == len);
-            for (script, status) in statuses {
-                if status.is_some() {
-                    let (_, index) = spks_index.get(&script).ok_or("Script not in index")?;
-                    let elapsed = SystemTime::now().duration_since(start).unwrap();
-                    let _ = log_tx.send(format!(
-                        "{:?} {} coin found at index {}",
-                        elapsed, change_str, index
-                    ));
-
-                    funded_spks.push(script);
-                }
-            }
-            Ok(())
-        }
-        CoinResponse::Error(e) => Err(format!("Electrum error: {}", e)),
-        _ => Err("Unexpected response type".to_string()),
-    }
-}
-
-fn get_txs_for_spk(
-    sender: &mut mpsc::Sender<CoinRequest>,
-    receiver: &mut mpsc::Receiver<CoinResponse>,
-    spk: ScriptBuf,
-    tx_map: &mut TxMap,
-) {
-    let req = CoinRequest::History(vec![spk]);
-    sender.send(req).unwrap();
-
-    let mut txids = vec![];
-    let resp: CoinResponse = receiver.recv().unwrap();
-    if let CoinResponse::History(hist) = resp {
-        for (_, vec) in hist {
-            for (txid, _) in vec {
-                txids.push(txid);
-            }
-        }
-    }
-
-    let txids: Vec<_> = txids
-        .into_iter()
-        .filter(|txid| !tx_map.contains_key(txid))
-        .collect();
-    if txids.is_empty() {
-        return;
-    }
-
-    let req = CoinRequest::Txs(txids.clone());
-    sender.send(req).unwrap();
-
-    let resp: CoinResponse = receiver.recv().unwrap();
-    if let CoinResponse::Txs(txs) = resp {
-        for tx in txs {
-            tx_map.insert(tx.compute_txid(), tx);
-        }
-    }
-}
-
-fn spks_from(
-    descriptor: &Descriptor<DescriptorPublicKey>,
-    start_index: u32,
-    batch: u32,
-) -> Vec<ScriptBuf> {
-    let mut out = vec![];
-    for index in start_index..start_index + batch {
-        let spk = descriptor
-            .at_derivation_index(index)
-            .unwrap()
-            .address(Network::Bitcoin)
-            .unwrap()
-            .script_pubkey();
-        out.push(spk);
-    }
-    out
 }

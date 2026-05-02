@@ -5,39 +5,29 @@ use std::{fs, path::PathBuf, sync::mpsc, time::SystemTime};
 
 #[derive(Parser, Debug)]
 #[command(name = "spk_recovery")]
-#[command(about = "SPK Recovery Tool - scan and recover Bitcoin from descriptors", long_about = None)]
+#[command(about = "SPK Recovery Tool - scan and recover Bitcoin from descriptors via Waterfalls", long_about = None)]
 struct Args {
     #[arg(short, long)]
     /// Path to the file containing the descriptor
     descriptor: PathBuf,
 
     #[arg(short, long)]
-    /// IP of the electrum server
-    ip: String,
+    /// Waterfalls server URL (e.g. https://waterfalls.example.com/api)
+    url: String,
 
     #[arg(short, long)]
-    /// Port of the electrum server
-    port: u16,
-
-    #[arg(short, long)]
-    /// Target derivation index
-    target: u32,
-
-    #[arg(short, long)]
-    /// Address where the coins will be spent
+    /// Address where the coins will be swept to
     address: String,
-
-    #[arg(short, long, default_value = "20000")]
-    /// Max subscription accepted by the server for each connection
-    max: u32,
-
-    #[arg(short, long, default_value = "10000")]
-    /// Batch size - how many spk we ask for each request
-    batch: u32,
 
     #[arg(short, long, default_value = "1")]
     /// Fee rate in sats/vb
     fee: u64,
+
+    #[arg(short, long, default_value = "100000")]
+    /// Minimum derivation index to scan up to. Forces the server past gap-limit-stop within this range.
+    /// Set high to catch funds past wide unused gaps. The server still applies its 20-address gap limit
+    /// past this index for the tail stop.
+    to_index: u32,
 }
 
 pub fn run(network: bitcoin::Network) -> Result<(), Box<dyn std::error::Error>> {
@@ -57,13 +47,10 @@ pub fn run(network: bitcoin::Network) -> Result<(), Box<dyn std::error::Error>> 
 
     let result = sync_wallet(
         descriptor_str,
-        args.ip,
-        args.port.to_string(),
-        args.target.to_string(),
+        args.url,
         args.address,
-        args.max.to_string(),
-        args.batch.to_string(),
         args.fee.to_string(),
+        args.to_index,
         log_tx,
         network,
     )?;
